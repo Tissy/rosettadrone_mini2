@@ -246,7 +246,7 @@
             android:layout_height="wrap_content"
             android:layout_marginLeft="10dp"
             android:gravity="left"
-            android:text="9Tek AS - One pice of the system"
+            android:text="Aerial Defence - S.TISSEYRE 2021"
             android:textColor="@color/colorGrey"
             android:textSize="12dp" />
 
