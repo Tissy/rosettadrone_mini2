@@ -56,7 +56,13 @@ import java.util.TimerTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import androidx.annotation.NonNull;
+
+import dji.common.airlink.ChannelSelectionMode;
+import dji.common.airlink.LightbridgeTransmissionMode;
+import dji.common.airlink.OcuSyncBandwidth;
+import dji.common.airlink.OcuSyncFrequencyBand;
 import dji.common.camera.SettingsDefinitions;
+import dji.common.camera.SystemState;
 import dji.common.error.DJIError;
 import dji.common.flightcontroller.Attitude;
 import dji.common.flightcontroller.ConnectionFailSafeBehavior;
@@ -81,6 +87,7 @@ import dji.common.mission.followme.FollowMeMission;
 import dji.common.mission.followme.FollowMeMissionState;
 import dji.common.mission.waypoint.Waypoint;
 import dji.common.mission.waypoint.WaypointAction;
+import dji.common.mission.waypoint.WaypointActionType;
 import dji.common.mission.waypoint.WaypointMission;
 import dji.common.mission.waypoint.WaypointMissionState;
 import dji.common.model.LocationCoordinate2D;
@@ -88,6 +95,7 @@ import dji.common.product.Model;
 import dji.common.remotecontroller.HardwareState;
 import dji.common.util.CommonCallbacks;
 import dji.sdk.battery.Battery;
+import dji.sdk.camera.VideoFeeder;
 import dji.sdk.flightcontroller.FlightController;
 import dji.sdk.gimbal.Gimbal;
 import dji.sdk.mission.MissionControl;
@@ -104,6 +112,7 @@ import static com.MAVLink.enums.MAV_CMD.MAV_CMD_NAV_TAKEOFF;
 import static com.MAVLink.enums.MAV_CMD.MAV_CMD_VIDEO_START_CAPTURE;
 import static com.MAVLink.enums.MAV_CMD.MAV_CMD_VIDEO_STOP_CAPTURE;
 import static com.MAVLink.enums.MAV_COMPONENT.MAV_COMP_ID_AUTOPILOT1;
+import static dji.common.mission.waypoint.WaypointActionType.STAY;
 import static sq.rogue.rosettadrone.util.getTimestampMicroseconds;
 import static sq.rogue.rosettadrone.util.safeSleep;
 
@@ -187,6 +196,7 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
     private float m_ServoPos_pitch = 0;
     private float m_ServoPos_yaw = 0;
     public boolean photoTaken = false;
+    public boolean photoTakenError = false;
     public boolean gotoNoPhoto = false;
     public double m_Curvesize = 0.0;
     public double m_POI_Lat = 0;
@@ -194,17 +204,21 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
     public boolean m_CruisingMode = false;
     public boolean m_Stay = false;
     public AtomicBoolean gimbalReady = null;
+    public WaypointMission m_activeWaypointMission = null;
+    public boolean pauseWaypointMission = false;
+    public boolean stopWaypointMission = false;
     private MiniPID miniPIDSide;
     private MiniPID miniPIDFwd;
     private MiniPID miniPIDAlti;
     private MiniPID miniPIDHeading;
-
+    private SystemState m_lastSystemState = null;
     private boolean mSafetyEnabled = true;
     private boolean mMotorsArmed = false;
     private FollowMeMissionOperator fmmo;
     public FlightController mFlightController;
     private Gimbal mGimbal = null;
     private Rotation mRotation = null;
+    private boolean m_Sim = false;
 
     private Model m_model;
 
@@ -216,6 +230,7 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
     DroneModel(MainActivity parent, DatagramSocket socket, boolean sim) {
         this.parent = parent;
         this.socket = socket;
+        this.m_Sim = sim;
         initFlightController(sim);
     }
 
@@ -246,7 +261,7 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
         miniPIDFwd = new MiniPID(0.35, 0.00008, 4.0);
         miniPIDAlti = new MiniPID(0.35, 0.00008, 4.0);
         miniPIDHeading = new MiniPID(1.0, 0.00001, 2.0);
-        
+
         //miniPIDSide.setOutputRampRate(0.3);
         //miniPIDFwd.setOutputRampRate(0.3);
 
@@ -491,37 +506,151 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
 
     void setWaypointMission(final WaypointMission wpMission) {
         mission_loaded = -1;
-        DJIError load_error = getWaypointMissionOperator().loadMission(wpMission);
-        if (load_error != null)
-            parent.logMessageDJI("loadMission() returned error: " + load_error.toString());
-        else {
-            parent.logMessageDJI("Uploading mission");
-            getWaypointMissionOperator().uploadMission(
-                    djiError -> {
-                        if (djiError == null) {
-                            while (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.UPLOADING) {
-                                safeSleep(200);
-                            }
-                            if (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.READY_TO_EXECUTE) {
-                                parent.logMessageDJI("Mission uploaded and ready to execute!");
-                                mission_loaded = MAV_MISSION_RESULT.MAV_MISSION_ACCEPTED;
-                                send_mission_ack(mission_loaded);
-                            } else {
-                                parent.logMessageDJI("Error uploading waypoint mission to drone.");
-                                mission_loaded = MAV_MISSION_RESULT.MAV_MISSION_ERROR;
-                                send_mission_ack(mission_loaded);
-                            }
+        m_activeWaypointMission = wpMission;
 
-                        } else {
-                            parent.logMessageDJI("Error uploading: " + djiError.getDescription());
-                            parent.logMessageDJI(("Please try re-uploading"));
-                            mission_loaded = MAV_MISSION_RESULT.MAV_MISSION_ERROR;
-                            send_mission_ack(mission_loaded);
-                        }
-                        //parent.logMessageDJI("New state: " + getWaypointMissionOperator().getCurrentState().getName());
-                    });
-        }
+        pauseWaypointMission = true;
+        stopWaypointMission = false;
+
+        parent.logMessageDJI("Mission uploaded and ready to execute via VirtStick!");
+        mission_loaded = MAV_MISSION_RESULT.MAV_MISSION_ACCEPTED;
+        send_mission_ack(mission_loaded);
     }
+
+    private Thread customWaypointInterpreter = new Thread() {
+        @Override
+        public void run() {
+            java.util.List<dji.common.mission.waypoint.Waypoint> waypointList = m_activeWaypointMission.getWaypointList();
+            
+            for (int i = 0; i < waypointList.size(); i++) {
+                // Reset Stateful deciders
+                gotoNoPhoto = true;
+                m_Stay = false;
+                m_CruisingMode = false;
+                m_POI_Lat = 0.0;
+                m_POI_Lon = 0.0;
+
+                if(pauseWaypointMission)
+                {
+                    while(pauseWaypointMission)
+                    {
+                        safeSleep(100);
+                    }
+                }
+
+                if(stopWaypointMission)
+                {
+                    return;
+                }
+
+                Waypoint currentTask  = waypointList.get(i);
+                // TODO
+
+                java.util.List<dji.common.mission.waypoint.WaypointAction> currentActions = currentTask.waypointActions;
+                /**
+                Implemented:
+                 //STAY(0),
+                 //START_TAKE_PHOTO(1),
+                 //START_RECORD(2),
+                 //STOP_RECORD(3),
+                 
+                 TODO:
+                 ROTATE_AIRCRAFT(4),
+                 GIMBAL_PITCH(5),
+                 CAMERA_ZOOM(7),
+                 CAMERA_FOCUS(8),
+                 PHOTO_GROUPING(11),
+                 FINE_TUNE_GIMBAL_PITCH(16),
+                 RESET_GIMBAL_YAW(17);
+                 */
+                
+                for (int x = 0; x < currentActions.size(); x++) {
+                    dji.common.mission.waypoint.WaypointAction currentAction = currentActions.get(x);
+                    switch(currentAction.actionType)
+                    {
+                        case STAY:
+                            m_Stay = true;
+                            break;
+                        case START_TAKE_PHOTO:
+                            gotoNoPhoto = false;
+                            break;
+                        case GIMBAL_PITCH:
+                            // TODO
+                            // Doublecheck vals
+                            //currentTask.gimbalPitch = currentAction.actionParam;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+
+                // Task
+                {
+                    LocationCoordinate2D targetLocation = currentTask.coordinate;
+                    double targetLatitude = targetLocation.getLatitude();
+                    double targetLongitude = targetLocation.getLongitude();
+
+                    int targetHeading = currentTask.heading;
+
+                    float targetAltitude = currentTask.altitude;
+
+                    // Lets just do it manually for now
+                    //float targetGimbalPitch = currentTask.gimbalPitch;
+                    //do_set_Gimbal(9, targetGimbalPitch);
+
+                    float targetSpeed = currentTask.speed;
+                    m_CruisingMode = targetSpeed <= 3.0;
+
+                    float targetCurveSize = currentTask.cornerRadiusInMeters;
+                    m_Curvesize = Math.max(targetCurveSize, 0.5);
+
+                    Log.d(TAG, "Waypoints: targetLongitude: " + targetLongitude + " targetLatitude: " + targetLatitude);
+
+                    // Takeoff to first wp altitude
+                    /*if(i == 0 && !isMotorsArmed())
+                    {
+                        do_takeoff(targetAltitude);
+                    }*/
+                    
+                    // Goto Action
+                    do_set_motion_absolute(targetLatitude, targetLongitude, targetAltitude, targetHeading <= 180 ? targetHeading : -180 + ((targetHeading) - 180), 2.5f, 2.5f, 2.5f, 2.5f, 0);
+                    while(mMoveToDataTimer != null || photoTaken != true)
+                    {
+                        ;
+                    }
+
+                    for (int x = 0; x < currentActions.size(); x++) {
+                        dji.common.mission.waypoint.WaypointAction currentAction = currentActions.get(x);
+                        switch(currentAction.actionType)
+                        {
+                            case START_RECORD:
+                                startRecordingVideo();
+                                break;
+                            case STOP_RECORD:
+                                stopRecordingVideo();
+                                break;
+                            case STAY:
+                                safeSleep(currentAction.actionParam);
+                                break;
+
+                            default:
+                                break;
+                        }
+                    }
+                }
+            }
+
+            // Reset Stateful deciders
+            gotoNoPhoto = true;
+            m_Stay = false;
+            m_CruisingMode = false;
+            m_POI_Lat = 0.0;
+            m_POI_Lon = 0.0;
+
+            // We had waypoints
+            if(m_activeWaypointMission.getWaypointCount() > 0)
+                do_go_home();
+        }
+    };
 
     private Aircraft getDjiAircraft() {
         return djiAircraft;
@@ -681,10 +810,50 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
         /**************************************************
          * Called whenever airlink quality changes        *
          **************************************************/
+        // Airlink takes a while to become accessible apparently on reconnect
+        while(djiAircraft.getAirLink() == null)
+            safeSleep(100);
 
         djiAircraft.getAirLink().setDownlinkSignalQualityCallback(i -> mDownlinkQuality = i);
 
         djiAircraft.getAirLink().setUplinkSignalQualityCallback(i -> mUplinkQuality = i);
+
+        // Deal with OcuSync
+        // if()...
+        djiAircraft.getAirLink().getOcuSyncLink().setChannelSelectionMode(ChannelSelectionMode.AUTO, djiError ->  { if(djiError != null)  Log.d(TAG, djiError.toString());});
+        djiAircraft.getAirLink().getOcuSyncLink().setFrequencyBand(OcuSyncFrequencyBand.FREQUENCY_BAND_DUAL, djiError ->  { if(djiError != null)  Log.d(TAG, djiError.toString());});
+        djiAircraft.getAirLink().getOcuSyncLink().setChannelBandwidth(OcuSyncBandwidth.Bandwidth20MHz, djiError -> { if(djiError != null)  Log.d(TAG, djiError.toString());});
+        
+        djiAircraft.getCamera().setSystemStateCallback(systemState -> {
+            if(m_lastSystemState == null)
+                m_lastSystemState = systemState;
+
+            boolean err = systemState.isOverheating() || systemState.hasError();
+            if((m_lastSystemState.isStoringPhoto() && !systemState.isStoringPhoto()) || ((m_lastSystemState.isShootingSinglePhoto() || m_lastSystemState.isShootingSinglePhotoInRAWFormat()) && !systemState.isShootingSinglePhoto() && !systemState.isShootingSinglePhotoInRAWFormat() && !systemState.isStoringPhoto()) || err)
+            {
+                if(photoTaken == false)
+                {
+                    photoTaken = true;
+                }
+                photoTakenError = err;
+            }
+
+            m_lastSystemState = systemState;
+        });
+        
+        if (this.m_Sim) {
+            LocationCoordinate2D pos = getSimPos2D();
+
+            mFlightController.getSimulator()
+                    .start(InitializationData.createInstance(pos, 10, 10),
+                            djiError -> {
+                                if (djiError != null) {
+                                    parent.logMessageDJI(djiError.getDescription());
+                                } else {
+                                    parent.logMessageDJI("Start Simulator Success");
+                                }
+                            });
+        }
 
         initMissionOperator();
 
@@ -1578,6 +1747,12 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
     }
 
     void request_mission_item(int seq) {
+        // Reset internal list
+        if(seq == 0)
+        {
+            stopWaypointMission();
+            m_activeWaypointMission = null;
+        }
 //        msg_mission_request msg = new msg_mission_request();
         msg_mission_request_int msg = new msg_mission_request_int();
         msg.seq = seq;
@@ -1589,66 +1764,39 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
         mAutonomy = false;
         parent.logMessageDJI("start WaypointMission()");
 
-        if (getWaypointMissionOperator() == null) {
-            parent.logMessageDJI("start WaypointMission() - WaypointMissionOperator null");
-            return;
-        }
-        if (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.READY_TO_EXECUTE) {
-            parent.logMessageDJI("Ready to execute mission!\n");
-        } else {
-            parent.logMessageDJI("Not ready to execute mission\n");
-            parent.logMessageDJI(getWaypointMissionOperator().getCurrentState().getName());
-            return;
-        }
         if (mSafetyEnabled) {
             parent.logMessageDJI("You must turn off the safety to start mission");
         } else {
-            getWaypointMissionOperator().startMission(djiError -> {
-                if (djiError != null)
-                    parent.logMessageDJI("Error: " + djiError.toString());
-                else
-                    parent.logMessageDJI("Mission started!");
-            });
+            pauseWaypointMission = false;
+
+            // Start our Waypoint routine
+            if(!customWaypointInterpreter.isAlive())
+                customWaypointInterpreter.start();
         }
     }
 
     public void stopWaypointMission() {
         mAutonomy = false;
-        if (getWaypointMissionOperator() == null) {
-            parent.logMessageDJI("stopWaypointMission() - mWaypointMissionOperator null");
-            return;
-        }
+        // Pause first to prevent potential races (should just use atomics..)
+        pauseWaypointMission = true;
+         // Set stop flag
+        stopWaypointMission = true;
+        // Proceed
+        pauseWaypointMission = false;
 
-        if (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.EXECUTING) {
-            parent.logMessageDJI("Stopping mission...\n");
-            getWaypointMissionOperator().stopMission(djiError -> {
-                if (djiError != null)
-                    parent.logMessageDJI("Error: " + djiError.toString());
-                else
-                    parent.logMessageDJI("Mission stopped!\n");
-            });
-        }
     }
 
     void pauseWaypointMission() {
         mAutonomy = false;
-        if (getWaypointMissionOperator() == null) {
-            parent.logMessageDJI("pauseWaypointMission() - mWaypointMissionOperator null");
-            return;
-        }
-
-        if (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.EXECUTING) {
-            parent.logMessageDJI("Pausing mission...\n");
-            getWaypointMissionOperator().pauseMission(djiError -> {
-                if (djiError != null)
-                    parent.logMessageDJI("Error: " + djiError.toString());
-                else
-                    parent.logMessageDJI("Mission paused!\n");
-            });
-        }
+        pauseWaypointMission = true;
     }
 
     void resumeWaypointMission() {
+        if(m_activeWaypointMission != null && !customWaypointInterpreter.isAlive()) {
+            startWaypointMission();
+            return;
+        }
+
         mAutonomy = false;
         if (isSafetyEnabled()) {
             parent.logMessageDJI(parent.getResources().getString(R.string.safety_launch));
@@ -1656,22 +1804,7 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
             return;
         }
 
-        if (getWaypointMissionOperator() == null) {
-            parent.logMessageDJI("resumeWaypointMission() - mWaypointMissionOperator null");
-            return;
-        }
-
-        if (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.EXECUTION_PAUSED) {
-            parent.logMessageDJI("Resuming mission...\n");
-            getWaypointMissionOperator().resumeMission(djiError -> {
-                if (djiError != null)
-                    parent.logMessageDJI("Error: " + djiError.toString());
-                else {
-                    parent.logMessageDJI("Mission resumed!\n");
-                    mGCSCommandedMode = NOT_USING_GCS_COMMANDED_MODE;
-                }
-            });
-        }
+        pauseWaypointMission = false;
     }
     //--------------------------------------------------------------------------------------
     //--------------------------------------------------------------------------------------
@@ -1755,17 +1888,11 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
             }
         }
 
- */
-        if (getWaypointMissionOperator().getCurrentState() == WaypointMissionState.READY_TO_EXECUTE) {
-            // But how about takeoff....
-            startWaypointMission();
-            send_command_ack(MAV_CMD_NAV_TAKEOFF, MAV_RESULT.MAV_RESULT_ACCEPTED);
-        } else {
-            FlightControllerState coord = djiAircraft.getFlightController().getState();
-            TimeLine.TimeLinetakeOff(coord.getAircraftLocation().getLatitude(), coord.getAircraftLocation().getLongitude(), alt, 0);
-            TimeLine.startTimeline();
-            Log.d(TAG, "Takeoff started...");
-        }
+*/
+        FlightControllerState coord = djiAircraft.getFlightController().getState();
+        TimeLine.TimeLinetakeOff(coord.getAircraftLocation().getLatitude(), coord.getAircraftLocation().getLongitude(), alt, 0);
+        TimeLine.startTimeline();
+        Log.d(TAG, "Takeoff started...");
     }
 
     void do_land() {
@@ -1991,6 +2118,7 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
                     } else {
                         gotoNoPhoto = false;
                         photoTaken = true;
+                        photoTakenError = false;
                     }
                     mMoveToDataTimer = null;
 
@@ -2274,12 +2402,12 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
 
         SettingsDefinitions.ShootPhotoMode photoMode = SettingsDefinitions.ShootPhotoMode.SINGLE;
         photoTaken = false;
+        photoTakenError = false;
 
         if (djiAircraft.getCamera() != null) {
             djiAircraft.getCamera().startShootPhoto(djiError -> {
                 if (djiError == null) {
-                    parent.logMessageDJI("Took photo");
-                    photoTaken = true;
+                    parent.logMessageDJI("Requested Photo");
 /*
                     msg_camera_image_captured msg = new msg_camera_image_captured();
                     msg.lat = (int)(m_Latitude*10000000);
@@ -2293,12 +2421,19 @@ public class DroneModel implements CommonCallbacks.CompletionCallback {
                     //send_command_ack(MAV_CMD_DO_SET_PARAMETER, MAV_RESULT.MAV_RESULT_ACCEPTED);
                     send_command_ack(MAV_CMD_DO_DIGICAM_CONTROL, MAV_RESULT.MAV_RESULT_ACCEPTED);
                 } else {
-                    parent.logMessageDJI("Error taking photo: " + djiError.toString());
-                    // resume
+                    parent.logMessageDJI("Error requesting photo: " + djiError.toString());
+                    // try again
                     takePhoto();
                 }
             });
         }
+
+        /*while(!photoTaken)
+        {
+            if(photoTakenError)
+                takePhoto(); // Retry on storage error, user needs to kill the app on full storage
+            safeSleep(250);
+        }*/
     }
 
     /********************************************

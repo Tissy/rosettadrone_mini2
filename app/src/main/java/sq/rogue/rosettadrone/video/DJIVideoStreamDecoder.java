@@ -273,7 +273,7 @@ public class DJIVideoStreamDecoder implements NativeHelper.NativeDataListener {
 
         try {
             // Create the codec instance.
-            codec = MediaCodec.createDecoderByType(VIDEO_ENCODING_FORMAT);
+            codec = MediaCodec.createByCodecName("OMX.google.h264.decoder");
             logd( "initVideoDecoder create: " + (codec == null));
             // Configure the codec. What should be noted here is that the hardware decoder would not output
             // any yuv data if a surface is configured into, which mean that if you want the yuv frames, you
@@ -592,6 +592,10 @@ public class DJIVideoStreamDecoder implements NativeHelper.NativeDataListener {
             DJIFrame newFrame = new DJIFrame(data, size, currentTime, currentTime, isKeyFrame, frameNum, frameIndex, width, height);
             dataHandler.obtainMessage(MSG_FRAME_QUEUE_IN, newFrame).sendToTarget();
 
+            // Pass raw Data further for streaming purposes, not a Yuv..
+            if (yuvDataListener != null) {
+                yuvDataListener.onYuvDataReceived(null,  ByteBuffer.wrap(data), size,  width, height);
+            }
         }
     }
 }
